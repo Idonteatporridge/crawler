@@ -14,7 +14,6 @@ log/
 
 # 数据文件
 *.xlsx
-*.csv
 
 # 测试文件
 test_*.py
