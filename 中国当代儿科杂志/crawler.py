@@ -1,0 +1,185 @@
+import requests
+from bs4 import BeautifulSoup
+import csv
+import re
+from urllib.parse import urljoin
+import os
+
+# 爬虫配置
+BASE_URL = "https://www.zgddek.com"
+ARCHIVE_URL = "https://www.zgddek.com/CN/archive_by_years"
+CSV_FILE = "all_pdfs.csv"
+CSV_FIELDS = ["article_id", "title", "year", "issue", "volume", "pages", "volumn_page", "pdf_url", "doi"]
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+def get_soup(url):
+    """获取指定URL的BeautifulSoup对象"""
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.encoding = r.apparent_encoding
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        print(f"获取页面失败 {url}: {e}")
+        return None
+
+# 获取所有过刊链接
+def get_all_volumn_links():
+    """从过刊浏览页面提取所有期号的URL"""
+    soup = get_soup(ARCHIVE_URL)
+    if not soup:
+        return []
+    
+    links = []
+    # 查找所有期号链接
+    for a in soup.find_all("a", href=re.compile(r"/CN/Y\d{4}/V\d+/I\d+")):
+        href = a["href"]
+        full_url = href if href.startswith("http") else urljoin(BASE_URL, href)
+        links.append(full_url)
+    
+    # 去重并返回
+    links = list(set(links))
+    # 按URL排序，使爬取顺序更有序
+    links.sort()
+    return links
+
+# 从每期提取PDF链接
+def extract_pdfs_from_volumn(vol_url):
+    """从指定期号页面提取所有PDF链接"""
+    soup = get_soup(vol_url)
+    if not soup:
+        return []
+    
+    pdfs = []
+    
+    # 从URL中提取年份、卷号和期号
+    year = "未知"
+    volume = "未知"
+    issue = "未知"
+    url_match = re.search(r"/CN/Y(\d{4})/V(\d+)/I(\d+)", vol_url)
+    if url_match:
+        year = url_match.group(1)
+        volume = url_match.group(2)
+        issue = url_match.group(3)
+    
+    # 查找所有文章列表项
+    for article in soup.find_all("li", class_="noselectrow"):
+        # 提取article_id
+        article_id = article.get("id", "")
+        if not article_id:
+            continue
+        
+        # 提取标题
+        title = "无标题"
+        title_div = article.find("div", class_="j-title-1")
+        if title_div:
+            title = title_div.get_text(strip=True) or "无标题"
+        
+        # 提取卷号、期号、页码信息
+        vol_issue_pages = ""
+        pages = ""
+        vol_div = article.find("div", class_="j-volumn-doi")
+        if vol_div:
+            vol_span = vol_div.find("span", class_="j-volumn")
+            if vol_span:
+                vol_issue_pages = vol_span.get_text(strip=True)
+                # 从格式 "2025, 27(7): 759-769." 中提取页码
+                pages_match = re.search(r":\s*(\d+-\d+)\.", vol_issue_pages)
+                if pages_match:
+                    pages = pages_match.group(1)
+        
+        # 提取DOI和PDF URL
+        doi = ""
+        pdf_url = ""
+        
+        # 先尝试从DOI链接提取
+        doi_a = article.find("a", class_="j-doi")
+        if doi_a:
+            doi = doi_a.get_text(strip=True)
+            # 从DOI构建PDF URL
+            if doi.startswith("https://doi.org/"):
+                doi_suffix = doi[16:]  # 去掉前缀 "https://doi.org/"
+                pdf_url = f"{BASE_URL}/CN/PDF/{doi_suffix}"
+        
+        # 如果没有DOI或PDF URL，尝试从j-pdf链接提取
+        if not pdf_url:
+            pdf_a = article.find("a", class_="j-pdf")
+            if pdf_a:
+                onclick = pdf_a.get("onclick", "")
+                # 从onclick属性中提取文章ID
+                id_match = re.search(r"lsdy1\('PDF','(\d+)'\)", onclick)
+                if id_match:
+                    pdf_id = id_match.group(1)
+                    pdf_url = f"{BASE_URL}/CN/PDF/{pdf_id}"
+        
+        if not pdf_url:
+            continue
+        
+        pdfs.append({
+            "article_id": article_id,
+            "title": title,
+            "year": year,
+            "issue": issue,
+            "volume": volume,
+            "pages": pages,
+            "volumn_page": vol_url,
+            "pdf_url": pdf_url,
+            "doi": doi
+        })
+    
+    return pdfs
+
+# 主程序
+def main():
+    print("开始爬取过刊PDF链接...")
+    
+    # 检查CSV文件是否存在，提取已爬取的期号URL
+    existing_volumn_pages = set()
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_volumn_pages.add(row["volumn_page"])
+        print(f"已找到现有CSV文件，跳过 {len(existing_volumn_pages)} 个已爬取的期号")
+    
+    # 获取所有期号URL并筛选出新的期号URL
+    volumn_urls = get_all_volumn_links()
+    if not volumn_urls:
+        print("未找到任何期号URL")
+        return
+    
+    new_volumn_urls = [url for url in volumn_urls if url not in existing_volumn_pages]
+    
+    if not new_volumn_urls:
+        print("没有新的期号需要爬取！")
+        return
+    
+    print(f"找到 {len(new_volumn_urls)} 个新的期号需要爬取")
+    
+    # 爬取新期号的文章信息
+    all_pdfs = []
+    for vol_url in new_volumn_urls:
+        print(f"爬取期号: {vol_url}")
+        pdfs = extract_pdfs_from_volumn(vol_url)
+        print(f"  该期包含 {len(pdfs)} 篇PDF")
+        all_pdfs.extend(pdfs)
+    
+    if not all_pdfs:
+        print("未找到任何PDF链接")
+        return
+    
+    # 写入CSV文件
+    file_exists = os.path.exists(CSV_FILE)
+    with open(CSV_FILE, "a" if file_exists else "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if not file_exists:
+            w.writeheader()
+        w.writerows(all_pdfs)
+    
+    print(f"爬取完成！共爬取了 {len(all_pdfs)} 篇文章，来自 {len(new_volumn_urls)} 个新期号。")
+    print(f"结果已保存到 {CSV_FILE}")
+
+if __name__ == "__main__":
+    main()
